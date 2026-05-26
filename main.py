@@ -15,7 +15,7 @@ APP_TITLE = "OnePass 密码管理器"
 VAULT_FILE = Path(__file__).resolve().with_name("vault.enc")
 MASTER_PASSWORD_PATTERN = re.compile(r"^\d{6,16}$")
 FIELDS = ["网站", "用户名", "密码", "邮箱", "电话", "备注"]
-LIST_COLUMNS = ["网站", "用户名", "邮箱", "电话"]
+LIST_COLUMNS = ["网站", "用户名", "密码", "邮箱", "电话"]
 PASSWORD_REVEAL_MS = 8000
 STATUS_CLEAR_MS = 5000
 AUTO_SAVE_DEBOUNCE_MS = 800
@@ -161,24 +161,17 @@ class OnePassApp:
         self.master_password: str | None = None
         self.records: list[dict[str, str]] = []
         self.selected_index: int | None = None
-        self.form_widgets: dict[str, tk.Widget] = {}
-        self.form_canvas: tk.Canvas | None = None
-        self.password_entry: ttk.Entry | None = None
-        self.password_toggle_button: ttk.Button | None = None
-        self.password_visible = False
-        self.password_hide_job: str | None = None
         self.tree: ttk.Treeview | None = None
         self.search_var: tk.StringVar | None = None
         self.status_var: tk.StringVar | None = None
         self.count_var: tk.StringVar | None = None
         self.status_clear_job: str | None = None
-        self.form_auto_save_job: str | None = None
-        self.form_events_bound = False
-        self.form_dirty = False
-        self.updating_form = False
         self.idle_lock_job: str | None = None
         self.idle_lock_enabled = False
         self.auth_notice: str | None = None
+        self.tree_menu: tk.Menu | None = None
+        self.context_menu_index: int | None = None
+        self.context_menu_column: str | None = None
 
         self._build_auth_screen()
 
@@ -274,7 +267,6 @@ class OnePassApp:
         self.search_var.trace_add("write", lambda *_args: self._refresh_tree())
         self.status_var = tk.StringVar(value=self._default_status_text())
         self.count_var = tk.StringVar(value="显示 0 / 0 条")
-        self.form_dirty = False
 
         shell = ttk.Frame(self.root, padding=16)
         shell.pack(fill="both", expand=True)
@@ -293,29 +285,18 @@ class OnePassApp:
         action_bar.pack(fill="x", pady=(0, 12))
 
         ttk.Button(action_bar, text="新增记录", command=self._new_record).pack(side="left")
-        ttk.Button(action_bar, text="保存当前", command=self._save_record).pack(side="left", padx=8)
-        ttk.Button(action_bar, text="删除记录", command=self._delete_record).pack(side="left")
-        ttk.Button(action_bar, text="复制密码", command=self._copy_password).pack(side="left", padx=8)
-        ttk.Button(action_bar, text="清空表单", command=self._clear_form).pack(side="left", padx=8)
+        ttk.Button(action_bar, text="删除记录", command=self._delete_record).pack(side="left", padx=8)
+        ttk.Button(action_bar, text="复制密码", command=self._copy_password).pack(side="left")
         ttk.Button(action_bar, text="导入", command=self._import_records).pack(side="left")
         ttk.Button(action_bar, text="导出 JSON", command=self._export_json_records).pack(side="left", padx=(8, 0))
         ttk.Button(action_bar, text="导出 CSV", command=self._export_csv_records).pack(side="left", padx=8)
         ttk.Button(action_bar, text="修改主密码", command=self._change_master_password).pack(side="left")
         ttk.Button(action_bar, text="锁定", command=self._lock_application).pack(side="right")
 
-        content = ttk.PanedWindow(shell, orient="horizontal")
+        content = ttk.Frame(shell)
         content.pack(fill="both", expand=True)
-
-        left_panel = ttk.Frame(content, padding=(0, 0, 12, 0))
-        right_panel = ttk.Frame(content)
-        content.add(left_panel, weight=3)
-        content.add(right_panel, weight=4)
-
-        self._build_record_list(left_panel)
-        self._build_form(right_panel)
-        self._bind_form_auto_save()
+        self._build_record_list(content)
         self._refresh_tree()
-        self._clear_form()
         self._enable_idle_lock()
 
         separator = ttk.Separator(shell, orient="horizontal")
@@ -344,7 +325,12 @@ class OnePassApp:
         self.tree = ttk.Treeview(table_frame, columns=LIST_COLUMNS, show="headings", height=20)
         for column in LIST_COLUMNS:
             self.tree.heading(column, text=column)
-            width = 180 if column == "网站" else 140
+            if column == "网站":
+                width = 180
+            elif column == "密码":
+                width = 180
+            else:
+                width = 140
             self.tree.column(column, width=width, anchor="w")
 
         y_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
@@ -359,61 +345,13 @@ class OnePassApp:
         table_frame.rowconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Double-1>", self._open_selected_record)
+        self.tree.bind("<Button-3>", self._show_tree_context_menu)
+        self.tree.bind("<Button-2>", self._show_tree_context_menu)
+        self.tree.bind("<Control-Button-1>", self._show_tree_context_menu)
 
-    def _build_form(self, parent: ttk.Frame) -> None:
-        form_frame = ttk.LabelFrame(parent, text="记录详情", padding=12)
-        form_frame.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(form_frame, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(form_frame, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        inner_frame = ttk.Frame(canvas)
-        inner_window = canvas.create_window((0, 0), window=inner_frame, anchor="nw")
-        inner_frame.bind(
-            "<Configure>",
-            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda event: canvas.itemconfigure(inner_window, width=event.width),
-        )
-
-        self.form_canvas = canvas
-        self.form_widgets = {}
-        self.password_entry = None
-        self.password_toggle_button = None
-        self.password_visible = False
-
-        for row_index, field in enumerate(FIELDS):
-            ttk.Label(inner_frame, text=field).grid(row=row_index, column=0, sticky="nw", pady=6)
-
-            if field == "备注":
-                text_widget = tk.Text(inner_frame, height=8, wrap="word", font=("PingFang SC", 11))
-                text_widget.grid(row=row_index, column=1, sticky="nsew", pady=6)
-                self.form_widgets[field] = text_widget
-                continue
-
-            if field == "密码":
-                password_row = ttk.Frame(inner_frame)
-                password_row.grid(row=row_index, column=1, sticky="ew", pady=6)
-                entry = ttk.Entry(password_row, show="*", font=("Menlo", 12))
-                entry.pack(side="left", fill="x", expand=True)
-                toggle_button = ttk.Button(password_row, text="显示", width=6, command=self._toggle_password)
-                toggle_button.pack(side="left", padx=(8, 0))
-                self.form_widgets[field] = entry
-                self.password_entry = entry
-                self.password_toggle_button = toggle_button
-                continue
-
-            entry = ttk.Entry(inner_frame, font=("PingFang SC", 11))
-            entry.grid(row=row_index, column=1, sticky="ew", pady=6)
-            self.form_widgets[field] = entry
-
-        inner_frame.columnconfigure(1, weight=1)
-        self._bind_form_scroll_recursive(inner_frame)
+        self.tree_menu = tk.Menu(self.root, tearoff=0)
+        self.tree_menu.add_command(label="复制", command=self._copy_context_cell)
 
     def _refresh_tree(self, select_index: int | None = None) -> None:
         if self.tree is None:
@@ -439,118 +377,8 @@ class OnePassApp:
         self.tree.focus(target_id)
         self.tree.see(target_id)
 
-    def _collect_form_data(self) -> dict[str, str]:
-        record: dict[str, str] = {}
-        for field in FIELDS:
-            widget = self.form_widgets[field]
-            if field == "备注":
-                text_widget = widget
-                assert isinstance(text_widget, tk.Text)
-                record[field] = text_widget.get("1.0", "end").rstrip()
-                continue
-
-            entry_widget = widget
-            assert isinstance(entry_widget, ttk.Entry)
-            value = entry_widget.get()
-            if field != "密码":
-                value = value.strip()
-            record[field] = value
-        return record
-
-    def _populate_form(self, record: dict[str, str]) -> None:
-        self.updating_form = True
-        self._hide_password()
-        for field in FIELDS:
-            value = record.get(field, "")
-            widget = self.form_widgets[field]
-            if field == "备注":
-                text_widget = widget
-                assert isinstance(text_widget, tk.Text)
-                text_widget.delete("1.0", "end")
-                text_widget.insert("1.0", value)
-                continue
-
-            entry_widget = widget
-            assert isinstance(entry_widget, ttk.Entry)
-            entry_widget.delete(0, "end")
-            entry_widget.insert(0, value)
-        self.updating_form = False
-        self.form_dirty = False
-
-    def _clear_form(self) -> None:
-        self.updating_form = True
-        self._hide_password()
-        self.selected_index = None
-        for field, widget in self.form_widgets.items():
-            if field == "备注":
-                text_widget = widget
-                assert isinstance(text_widget, tk.Text)
-                text_widget.delete("1.0", "end")
-                continue
-
-            entry_widget = widget
-            assert isinstance(entry_widget, ttk.Entry)
-            entry_widget.delete(0, "end")
-
-        if self.tree is not None:
-            self.tree.selection_remove(self.tree.selection())
-
-        first_widget = self.form_widgets.get("网站")
-        if isinstance(first_widget, ttk.Entry):
-            first_widget.focus_set()
-        self.updating_form = False
-        self.form_dirty = False
-        self._cancel_form_auto_save()
-
     def _new_record(self) -> None:
-        self._clear_form()
-        self._set_status("已切换到新建记录。")
-
-    def _save_record(self, silent: bool = False) -> bool:
-        if self.master_password is None:
-            if not silent:
-                messagebox.showerror("未解锁", "请先输入主密码。")
-            return False
-
-        record = self._collect_form_data()
-        if not any(record.values()):
-            if silent:
-                self.form_dirty = False
-                return False
-            messagebox.showerror("内容为空", "请至少填写一项记录内容。")
-            return False
-
-        previous_record: dict[str, str] | None = None
-        created_new_record = False
-        if self.selected_index is None:
-            self.records.append(record)
-            self.selected_index = len(self.records) - 1
-            created_new_record = True
-        else:
-            previous_record = self.records[self.selected_index].copy()
-            self.records[self.selected_index] = record
-
-        if not self._persist_records():
-            if created_new_record:
-                self.records.pop()
-                self.selected_index = None
-            elif previous_record is not None and self.selected_index is not None:
-                self.records[self.selected_index] = previous_record
-            return False
-
-        self._refresh_tree(select_index=self.selected_index)
-        if self.tree is not None and self.selected_index is not None:
-            selected_id = str(self.selected_index)
-            self.tree.selection_set(selected_id)
-            self.tree.focus(selected_id)
-            self.tree.see(selected_id)
-        self.form_dirty = False
-        self._cancel_form_auto_save()
-        if silent:
-            self._set_status("记录已自动保存。")
-        else:
-            self._set_status("记录已保存，并重新写入 AES 加密密码库。")
-        return True
+        self._open_record_dialog(record=None, index=None)
 
     def _delete_record(self) -> None:
         if self.selected_index is None:
@@ -569,7 +397,6 @@ class OnePassApp:
             self.selected_index = deleted_index
             return
 
-        self._clear_form()
         self._refresh_tree()
         self._set_status("记录已删除。")
 
@@ -584,26 +411,7 @@ class OnePassApp:
             return False
         return True
 
-    def _toggle_password(self) -> None:
-        if self.password_entry is None or not self.password_entry.winfo_exists():
-            return
-
-        self.password_visible = not self.password_visible
-        self.password_entry.configure(show="" if self.password_visible else "*")
-        if self.password_toggle_button is not None and self.password_toggle_button.winfo_exists():
-            self.password_toggle_button.configure(text="隐藏" if self.password_visible else "显示")
-
-        if self.password_visible:
-            self._schedule_password_hide()
-            self._set_status(f"密码已显示，将在 {PASSWORD_REVEAL_MS // 1000} 秒后自动隐藏。")
-        else:
-            self._cancel_password_hide()
-            self._set_status("密码已隐藏。")
-
     def _on_tree_select(self, _event: tk.Event) -> None:
-        if self.form_dirty:
-            self._save_record(silent=True)
-
         if self.tree is None:
             return
 
@@ -613,23 +421,60 @@ class OnePassApp:
             return
 
         self.selected_index = int(selection[0])
-        self._populate_form(self.records[self.selected_index])
-        self._set_status("已加载选中记录。")
+        self._set_status("已选中记录。")
+
+    def _show_tree_context_menu(self, event: tk.Event) -> None:
+        if self.tree is None or self.tree_menu is None:
+            return
+
+        row_id = self.tree.identify_row(event.y)
+        column_id = self.tree.identify_column(event.x)
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell" or not row_id or not column_id:
+            return
+
+        index = int(row_id)
+        column_index = int(column_id.replace("#", "")) - 1
+        if column_index < 0 or column_index >= len(LIST_COLUMNS):
+            return
+
+        self.context_menu_index = index
+        self.context_menu_column = LIST_COLUMNS[column_index]
+        self.selected_index = index
+        self.tree.selection_set(row_id)
+        self.tree.focus(row_id)
+        self.tree_menu.tk_popup(event.x_root, event.y_root)
+        self.tree_menu.grab_release()
+
+    def _copy_context_cell(self) -> None:
+        if self.context_menu_index is None or self.context_menu_column is None:
+            return
+
+        value = self._get_cell_value(self.context_menu_index, self.context_menu_column)
+        if not value:
+            messagebox.showerror("没有内容", "当前单元格没有可复制的内容。")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self.root.update()
+        self._set_status(f"已复制{self.context_menu_column}单元格内容。")
+
+    def _open_selected_record(self, _event: tk.Event | None = None) -> None:
+        if self.selected_index is None:
+            return
+        self._open_record_dialog(self.records[self.selected_index].copy(), self.selected_index)
 
     def _clear_root(self) -> None:
-        self._cancel_password_hide()
         self._cancel_status_clear()
-        self._cancel_form_auto_save()
         self._cancel_idle_lock()
         self.root.unbind("<Return>")
         for child in self.root.winfo_children():
             child.destroy()
-        self.password_entry = None
-        self.password_toggle_button = None
-        self.form_canvas = None
         self.tree = None
-        self.form_widgets = {}
-        self.form_events_bound = False
+        self.tree_menu = None
+        self.context_menu_index = None
+        self.context_menu_column = None
 
     def _get_filtered_records(self) -> list[tuple[int, dict[str, str]]]:
         term = ""
@@ -654,11 +499,11 @@ class OnePassApp:
         self._set_status("已清除搜索条件。")
 
     def _copy_password(self) -> None:
-        password_widget = self.form_widgets.get("密码")
-        if not isinstance(password_widget, ttk.Entry):
+        if self.selected_index is None:
+            messagebox.showerror("未选择记录", "请先从列表中选择一条记录。")
             return
 
-        password = password_widget.get()
+        password = self.records[self.selected_index].get("密码", "")
         if not password:
             messagebox.showerror("没有密码", "当前记录没有可复制的密码。")
             return
@@ -668,13 +513,178 @@ class OnePassApp:
         self.root.update()
         self._set_status("密码已复制到剪贴板。")
 
-    def _change_master_password(self) -> None:
+    def _get_cell_value(self, index: int, column: str) -> str:
+        return self.records[index].get(column, "")
+
+    def _open_record_dialog(self, record: dict[str, str] | None, index: int | None) -> None:
         if self.master_password is None:
             messagebox.showerror("未解锁", "请先输入主密码。")
             return
 
-        if self.form_dirty and not self._save_record(silent=True):
-            messagebox.showerror("无法修改", "当前表单存在未保存内容，且自动保存失败。")
+        resume_idle_lock = self.idle_lock_enabled
+        if resume_idle_lock:
+            self._disable_idle_lock()
+
+        dialog = tk.Toplevel(self.root)
+        dialog_title = "新增记录" if index is None else "记录详情"
+        dialog.title(dialog_title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("560x460")
+        dialog.minsize(500, 420)
+
+        form_frame = ttk.Frame(dialog, padding=20)
+        form_frame.pack(fill="both", expand=True)
+
+        ttk.Label(form_frame, text=dialog_title, font=("PingFang SC", 14, "bold")).grid(
+            row=0,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(0, 12),
+        )
+
+        form_widgets: dict[str, tk.Widget] = {}
+        password_entry: ttk.Entry | None = None
+        password_toggle_button: ttk.Button | None = None
+        password_visible = False
+        password_hide_job: str | None = None
+        initial_record = VaultStorage._normalize_record(record or {})
+
+        def cancel_password_hide() -> None:
+            nonlocal password_hide_job
+            if password_hide_job is None:
+                return
+            try:
+                dialog.after_cancel(password_hide_job)
+            except ValueError:
+                pass
+            password_hide_job = None
+
+        def hide_password() -> None:
+            nonlocal password_visible
+            cancel_password_hide()
+            password_visible = False
+            if password_entry is not None and password_entry.winfo_exists():
+                password_entry.configure(show="*")
+            if password_toggle_button is not None and password_toggle_button.winfo_exists():
+                password_toggle_button.configure(text="显示")
+
+        def toggle_password() -> None:
+            nonlocal password_visible, password_hide_job
+            if password_entry is None or not password_entry.winfo_exists():
+                return
+
+            password_visible = not password_visible
+            password_entry.configure(show="" if password_visible else "*")
+            if password_toggle_button is not None and password_toggle_button.winfo_exists():
+                password_toggle_button.configure(text="隐藏" if password_visible else "显示")
+
+            if password_visible:
+                cancel_password_hide()
+                password_hide_job = dialog.after(PASSWORD_REVEAL_MS, hide_password)
+            else:
+                cancel_password_hide()
+
+        for row_index, field in enumerate(FIELDS, start=1):
+            ttk.Label(form_frame, text=field).grid(row=row_index, column=0, sticky="nw", pady=6)
+
+            if field == "备注":
+                text_widget = tk.Text(form_frame, height=8, wrap="word", font=("PingFang SC", 11))
+                text_widget.grid(row=row_index, column=1, columnspan=2, sticky="nsew", pady=6)
+                text_widget.insert("1.0", initial_record.get(field, ""))
+                form_widgets[field] = text_widget
+                continue
+
+            if field == "密码":
+                password_row = ttk.Frame(form_frame)
+                password_row.grid(row=row_index, column=1, columnspan=2, sticky="ew", pady=6)
+                entry = ttk.Entry(password_row, show="*", font=("Menlo", 12))
+                entry.pack(side="left", fill="x", expand=True)
+                entry.insert(0, initial_record.get(field, ""))
+                toggle_button = ttk.Button(password_row, text="显示", width=6, command=toggle_password)
+                toggle_button.pack(side="left", padx=(8, 0))
+                form_widgets[field] = entry
+                password_entry = entry
+                password_toggle_button = toggle_button
+                continue
+
+            entry = ttk.Entry(form_frame, font=("PingFang SC", 11))
+            entry.grid(row=row_index, column=1, columnspan=2, sticky="ew", pady=6)
+            entry.insert(0, initial_record.get(field, ""))
+            form_widgets[field] = entry
+
+        form_frame.columnconfigure(1, weight=1)
+        form_frame.rowconfigure(FIELDS.index("备注") + 1, weight=1)
+
+        def collect_record() -> dict[str, str]:
+            collected: dict[str, str] = {}
+            for field in FIELDS:
+                widget = form_widgets[field]
+                if field == "备注":
+                    assert isinstance(widget, tk.Text)
+                    collected[field] = widget.get("1.0", "end").rstrip()
+                    continue
+
+                assert isinstance(widget, ttk.Entry)
+                value = widget.get()
+                if field != "密码":
+                    value = value.strip()
+                collected[field] = value
+            return VaultStorage._normalize_record(collected)
+
+        def close_dialog() -> None:
+            cancel_password_hide()
+            dialog.unbind("<Return>")
+            dialog.unbind("<Escape>")
+            dialog.destroy()
+            if resume_idle_lock and self.master_password is not None:
+                self._enable_idle_lock()
+
+        def save_record() -> None:
+            current_record = collect_record()
+            if not any(current_record.values()):
+                messagebox.showerror("内容为空", "请至少填写一项记录内容。", parent=dialog)
+                return
+
+            previous_records = [item.copy() for item in self.records]
+            if index is None:
+                self.records.append(current_record)
+                new_index = len(self.records) - 1
+            else:
+                self.records[index] = current_record
+                new_index = index
+
+            if not self._persist_records():
+                self.records = previous_records
+                return
+
+            self.selected_index = new_index
+            self._refresh_tree(select_index=new_index)
+            close_dialog()
+            action_text = "新增" if index is None else "更新"
+            self._set_status(f"记录已{action_text}并保存。")
+
+        button_row = ttk.Frame(form_frame)
+        button_row.grid(row=len(FIELDS) + 1, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(button_row, text="取消", command=close_dialog).pack(side="right")
+        ttk.Button(button_row, text="保存", command=save_record).pack(side="right", padx=(0, 8))
+
+        dialog.bind("<Return>", lambda _event: save_record())
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        first_widget = form_widgets.get("网站")
+        if isinstance(first_widget, ttk.Entry):
+            first_widget.focus_set()
+
+        self.root.wait_window(dialog)
+        if resume_idle_lock and self.master_password is not None and not self.idle_lock_enabled:
+            self._enable_idle_lock()
+
+    def _change_master_password(self) -> None:
+        if self.master_password is None:
+            messagebox.showerror("未解锁", "请先输入主密码。")
             return
 
         resume_idle_lock = self.idle_lock_enabled
@@ -816,7 +826,6 @@ class OnePassApp:
             self.search_var.set("")
 
         self.selected_index = start_index
-        self._populate_form(self.records[start_index])
         self._refresh_tree(select_index=start_index)
         self._set_status(f"已导入 {len(imported_records)} 条记录。")
 
@@ -882,27 +891,6 @@ class OnePassApp:
 
         self._set_status(f"已导出 {len(self.records)} 条记录到 {Path(export_path).name}。")
 
-    def _schedule_password_hide(self) -> None:
-        self._cancel_password_hide()
-        self.password_hide_job = self.root.after(PASSWORD_REVEAL_MS, self._hide_password)
-
-    def _cancel_password_hide(self) -> None:
-        if self.password_hide_job is None:
-            return
-        try:
-            self.root.after_cancel(self.password_hide_job)
-        except ValueError:
-            pass
-        self.password_hide_job = None
-
-    def _hide_password(self) -> None:
-        self._cancel_password_hide()
-        self.password_visible = False
-        if self.password_entry is not None and self.password_entry.winfo_exists():
-            self.password_entry.configure(show="*")
-        if self.password_toggle_button is not None and self.password_toggle_button.winfo_exists():
-            self.password_toggle_button.configure(text="显示")
-
     def _default_status_text(self) -> str:
         return f"密码库已解锁，空闲 {IDLE_LOCK_MS // 60000} 分钟后自动锁定。"
 
@@ -926,73 +914,6 @@ class OnePassApp:
         except ValueError:
             pass
         self.status_clear_job = None
-
-    def _bind_form_auto_save(self) -> None:
-        if self.form_events_bound:
-            return
-
-        for field, widget in self.form_widgets.items():
-            if field == "备注":
-                text_widget = widget
-                assert isinstance(text_widget, tk.Text)
-                text_widget.bind("<KeyRelease>", self._on_form_changed, add="+")
-                text_widget.bind("<<Paste>>", self._on_form_changed, add="+")
-                text_widget.bind("<<Cut>>", self._on_form_changed, add="+")
-                continue
-
-            entry_widget = widget
-            assert isinstance(entry_widget, ttk.Entry)
-            entry_widget.bind("<KeyRelease>", self._on_form_changed, add="+")
-            entry_widget.bind("<<Paste>>", self._on_form_changed, add="+")
-            entry_widget.bind("<<Cut>>", self._on_form_changed, add="+")
-
-        self.form_events_bound = True
-
-    def _on_form_changed(self, _event: tk.Event) -> None:
-        if self.updating_form:
-            return
-        self.form_dirty = True
-        self._schedule_form_auto_save()
-
-    def _schedule_form_auto_save(self) -> None:
-        self._cancel_form_auto_save()
-        self.form_auto_save_job = self.root.after(AUTO_SAVE_DEBOUNCE_MS, self._auto_save_form)
-
-    def _cancel_form_auto_save(self) -> None:
-        if self.form_auto_save_job is None:
-            return
-        try:
-            self.root.after_cancel(self.form_auto_save_job)
-        except ValueError:
-            pass
-        self.form_auto_save_job = None
-
-    def _auto_save_form(self) -> None:
-        self.form_auto_save_job = None
-        if not self.form_dirty:
-            return
-        self._save_record(silent=True)
-
-    def _bind_form_scroll_recursive(self, widget: tk.Widget) -> None:
-        widget.bind("<MouseWheel>", self._on_form_mousewheel, add="+")
-        widget.bind("<Button-4>", self._on_form_mousewheel_linux, add="+")
-        widget.bind("<Button-5>", self._on_form_mousewheel_linux, add="+")
-        for child in widget.winfo_children():
-            self._bind_form_scroll_recursive(child)
-
-    def _on_form_mousewheel(self, event: tk.Event):
-        if self.form_canvas is None or event.delta == 0:
-            return None
-        direction = -1 if event.delta > 0 else 1
-        self.form_canvas.yview_scroll(direction, "units")
-        return "break"
-
-    def _on_form_mousewheel_linux(self, event: tk.Event):
-        if self.form_canvas is None:
-            return None
-        direction = -1 if getattr(event, "num", None) == 4 else 1
-        self.form_canvas.yview_scroll(direction, "units")
-        return "break"
 
     def _run_modal_action(self, callback, *args, **kwargs):
         resume_idle_lock = self.idle_lock_enabled
@@ -1050,12 +971,7 @@ class OnePassApp:
         self._lock_application(auto_locked=True)
 
     def _lock_application(self, auto_locked: bool = False) -> None:
-        if self.form_dirty:
-            self._save_record(silent=True)
-
         self._disable_idle_lock()
-        self._hide_password()
-        self._cancel_form_auto_save()
         try:
             self.root.clipboard_clear()
         except tk.TclError:
